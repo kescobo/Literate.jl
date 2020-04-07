@@ -202,7 +202,7 @@ end
 
 filename(str) = first(splitext(last(splitdir(str))))
 
-function create_configuration(inputfile; user_config, user_kwargs)
+function create_configuration(inputfile; user_config, user_kwargs, type=nothing)
     # Combine user config with user kwargs
     user_config = Dict{String,Any}(string(k) => v for (k, v) in user_config)
     user_kwargs = Dict{String,Any}(string(k) => v for (k, v) in user_kwargs)
@@ -218,7 +218,7 @@ function create_configuration(inputfile; user_config, user_kwargs)
     cfg["keep_comments"] = false
     cfg["codefence"] = get(user_config, "documenter", true) ?
         ("```@example $(get(user_config, "name", cfg["name"]))" => "```") : ("```julia" => "```")
-    cfg["execute"] = true
+    cfg["execute"] = type === :md ? false : true
     # Guess the package (or repository) root url
     edit_commit = "master" # TODO: Make this configurable like Documenter?
     deploy_branch = "gh-pages" # TODO: Make this configurable like Documenter?
@@ -368,7 +368,7 @@ of possible configuration with `config` and other keyword arguments.
 """
 function markdown(inputfile, outputdir; config::Dict=Dict(), kwargs...)
     # Create configuration by merging default and userdefined
-    config = create_configuration(inputfile; user_config=config, user_kwargs=kwargs)
+    config = create_configuration(inputfile; user_config=config, user_kwargs=kwargs, type=:md)
 
     # normalize paths
     inputfile = normpath(inputfile)
@@ -401,6 +401,7 @@ function markdown(inputfile, outputdir; config::Dict=Dict(), kwargs...)
     content = replace_default(content, :md; config=config)
 
     # create the markdown file
+    sb = sandbox()
     chunks = parse(content)
     iomd = IOBuffer()
     continued = false
@@ -426,6 +427,12 @@ function markdown(inputfile, outputdir; config::Dict=Dict(), kwargs...)
                 write(iomd, "nothing #hide\n")
             end
             write(iomd, codefence.second, '\n')
+            if config["execute"]::Bool
+                res = execute_markdown(sb, join(chunk.lines, '\n'), outputdir)
+                if res !== nothing && !REPL.ends_with_semicolon(last_line)
+                    write(iomd, res, '\n')
+                end
+            end
         end
         write(iomd, '\n') # add a newline between each chunk
     end
@@ -442,6 +449,31 @@ function markdown(inputfile, outputdir; config::Dict=Dict(), kwargs...)
 
     return outputfile
 end
+
+function execute_markdown(sb, block, outputdir)
+    @show block
+    r, status, _, str = Documenter.withoutput() do
+        include_string(sb, block)
+    end
+    # TODO: check status
+    # TODO: do something with stdout/stderr output in str??
+    r === nothing && return nothing
+    for (mime, ext) in [(MIME("image/png"), ".png"), (MIME("image/jpeg"), ".jpeg")]
+        if showable(mime, r)
+            file = string(hash(block) % UInt32) * ext
+            open(joinpath(outputdir, file), "w") do io
+                Base.invokelatest(show, io, mime, r)
+            end
+            return "![]($(file))"
+        end
+    end
+    io = IOBuffer()
+    write(io, "```\n")
+    Base.invokelatest(show, io, "text/plain", r)
+    write(io, "\n```")
+    return String(take!(io))
+end
+
 
 const JUPYTER_VERSION = v"4.3.0"
 
@@ -568,15 +600,7 @@ function notebook(inputfile, outputdir; config::Dict=Dict(), kwargs...)
 end
 
 function execute_notebook(nb)
-    m = Module(gensym())
-    # eval(expr) is available in the REPL (i.e. Main) so we emulate that for the sandbox
-    Core.eval(m, :(eval(x) = Core.eval($m, x)))
-    # modules created with Module() does not have include defined
-    # abspath is needed since this will call `include_relative`
-    Core.eval(m, :(include(x) = Base.include($m, abspath(x))))
-
-    io = IOBuffer()
-
+    m = sandbox()
     execution_count = 0
     for cell in nb["cells"]
         cell["cell_type"] == "code" || continue
@@ -633,6 +657,17 @@ function execute_notebook(nb)
 
     end
     return nb
+end
+
+# Create a sandbox module for evaluation
+function sandbox()
+    m = Module(gensym())
+    # eval(expr) is available in the REPL (i.e. Main) so we emulate that for the sandbox
+    Core.eval(m, :(eval(x) = Core.eval($m, x)))
+    # modules created with Module() does not have include defined
+    # abspath is needed since this will call `include_relative`
+    Core.eval(m, :(include(x) = Base.include($m, abspath(x))))
+    return m
 end
 
 end # module
